@@ -2,3 +2,4 @@ demucs
 python-multipart
 fastapi
 uvicorn
+minio
