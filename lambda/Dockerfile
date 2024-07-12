@@ -6,7 +6,7 @@ ENV AWS_LWA_PORT=8000
 ENV TORCH_HOME=/tmp
 
 WORKDIR /app
-COPY app.py .env /app/
+COPY lambda.py .env /app/
 
 ENTRYPOINT [ "python" ]
-CMD [ "app.py" ]
+CMD [ "lambda.py" ]
