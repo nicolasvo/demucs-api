@@ -1,12 +1,14 @@
+import json
 from fastapi import FastAPI, File, UploadFile, Form
 from minio import Minio
 from minio.retention import Retention
 from minio.commonconfig import GOVERNANCE
+import requests
 
 import uuid
 import os
 from dotenv import load_dotenv
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import tempfile
 
 load_dotenv()
@@ -15,9 +17,9 @@ app = FastAPI()
 # TODO: default remove voice from song
 
 
-def upload_minio(file_path: str, file_name: str, uid: str):
+def upload_track(file_path: str, file_name: str, uid: str):
     client = Minio(
-        os.getenv("ENDPOINT_URL"),
+        os.getenv("MINIO_URL"),
         access_key=os.getenv("ACCESS_KEY"),
         secret_key=os.getenv("SECRET_KEY"),
         secure=False,
@@ -34,7 +36,7 @@ def upload_minio(file_path: str, file_name: str, uid: str):
     # Make the bucket if it doesn't exist.
     found = client.bucket_exists(bucket_name)
     if not found:
-        client.make_bucket(bucket_name)
+        client.make_bucket(bucket_name, object_lock=True)
         print("Created bucket", bucket_name)
     else:
         print("Bucket", bucket_name, "already exists")
@@ -44,11 +46,9 @@ def upload_minio(file_path: str, file_name: str, uid: str):
         bucket_name,
         destination_file,
         source_file,
-        retention=Retention(
-            GOVERNANCE,
-            datetime.now(datetime.UTC) + timedelta(days=1),
-        ),
     )
+    config = Retention(GOVERNANCE, datetime.utcnow() + timedelta(days=1))
+    client.set_object_retention(bucket_name, destination_file, config)
     print(
         source_file,
         "successfully uploaded as object",
@@ -66,19 +66,26 @@ async def upload_mp3_file(
 ):
     if file.content_type == "audio/mpeg":
         uid = str(uuid.uuid4())
-        track_name = file.filename.split(".mp3")[0]
         with tempfile.TemporaryDirectory(dir="/tmp/") as tmp_dir:
             tmp_file = tmp_dir + "/" + file.filename
             with open(tmp_file, "wb") as f:
                 f.write(file.file.read())
-                upload_minio(tmp_file, file.filename, uid)
+                upload_track(tmp_file, file.filename, uid)
 
-        return {
-            "filename": tmp_file,
-            "content_type": file.content_type,
+        data = {
+            "file_name": file.filename,
+            "uid": uid,
             "separate": separate,
-            "part": track,
+            "track": track,
         }
+        try:
+            response = requests.post(os.getenv("LAMBDA_URL"), params=data)
+            if response.status_code != 200:
+                return f"error: {response.text}"
+        except Exception as e:
+            return f"error: {e}"
+
+        return response.json()
     else:
         return {"error": "Invalid file format. Please upload an MP3 file."}
 
@@ -86,4 +93,4 @@ async def upload_mp3_file(
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=True)

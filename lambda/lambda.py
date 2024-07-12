@@ -1,11 +1,13 @@
-from fastapi import FastAPI, File, UploadFile, Form
+from fastapi import FastAPI
 import demucs.separate
 from minio import Minio
-from minio.error import S3Error
+from minio.retention import Retention
+from minio.commonconfig import GOVERNANCE
 
-import uuid
 import os
 from dotenv import load_dotenv
+from datetime import datetime, timedelta
+
 
 load_dotenv()
 app = FastAPI()
@@ -13,9 +15,9 @@ app = FastAPI()
 # TODO: default remove voice from song
 
 
-def upload_minio(file_path: str, file_name: str, uid: str):
+def upload_track(file_path: str, file_name: str, uid: str):
     client = Minio(
-        os.getenv("ENDPOINT_URL"),
+        os.getenv("MINIO_URL"),
         access_key=os.getenv("ACCESS_KEY"),
         secret_key=os.getenv("SECRET_KEY"),
         secure=False,
@@ -32,7 +34,7 @@ def upload_minio(file_path: str, file_name: str, uid: str):
     # Make the bucket if it doesn't exist.
     found = client.bucket_exists(bucket_name)
     if not found:
-        client.make_bucket(bucket_name)
+        client.make_bucket(bucket_name, object_lock=True)
         print("Created bucket", bucket_name)
     else:
         print("Bucket", bucket_name, "already exists")
@@ -43,6 +45,8 @@ def upload_minio(file_path: str, file_name: str, uid: str):
         destination_file,
         source_file,
     )
+    config = Retention(GOVERNANCE, datetime.utcnow() + timedelta(days=1))
+    client.set_object_retention(bucket_name, destination_file, config)
     print(
         source_file,
         "successfully uploaded as object",
@@ -52,45 +56,70 @@ def upload_minio(file_path: str, file_name: str, uid: str):
     )
 
 
-@app.post("/upload/")
-async def upload_mp3_file(
-    file: UploadFile = File(...),
-    separate: str = Form(..., regex="^(only|everything)$"),
-    track: str = Form(..., regex="^(drums|bass|other|vocals)$"),
+def download_track(file_name: str, uid: str, destination_file: str):
+    client = Minio(
+        os.getenv("MINIO_URL"),
+        access_key=os.getenv("ACCESS_KEY"),
+        secret_key=os.getenv("SECRET_KEY"),
+        secure=False,
+    )
+
+    bucket_name = "songs"
+    response = client.fget_object(bucket_name, f"{uid}/{file_name}", destination_file)
+
+
+def get_presigned_url(file_name: str, uid: str):
+    client = Minio(
+        os.getenv("MINIO_URL"),
+        access_key=os.getenv("ACCESS_KEY"),
+        secret_key=os.getenv("SECRET_KEY"),
+        secure=False,
+    )
+
+    bucket_name = "separated"
+    url = client.presigned_get_object(
+        bucket_name,
+        f"{uid}/{file_name}",
+        expires=timedelta(hours=1),
+    )
+
+    return url
+
+
+@app.post("/split_track/")
+async def split_track(
+    file_name: str,
+    uid: str,
+    separate: str,
+    track: str,
 ):
-    if file.content_type == "audio/mpeg":
-        uid = str(uuid.uuid4())
-        tmp_dir = f"/tmp/{uid}"
-        tmp_file = tmp_dir + "/" + file.filename
-        track_name = file.filename.split(".mp3")[0]
-        os.makedirs(tmp_dir, exist_ok=True)
-        with open(tmp_file, "wb") as f:
-            f.write(file.file.read())
+    tmp_dir = f"/tmp/{uid}"
+    tmp_file = tmp_dir + "/" + file_name
+    track_name = file_name.split(".mp3")[0]
+    os.makedirs(tmp_dir, exist_ok=True)
+    download_track(file_name, uid, tmp_file)
 
-        if separate == "only":
-            demucs.separate.main(
-                ["--mp3", "--two-stems", track, tmp_file, "-o", f"/tmp/{uid}"]
-            )
-        elif separate == "everything":
-            demucs.separate.main(["--mp3", tmp_file, "-o", f"/tmp/{uid}"])
+    if separate == "only":
+        demucs.separate.main(
+            ["--mp3", "--two-stems", track, tmp_file, "-o", f"/tmp/{uid}"]
+        )
+    elif separate == "everything":
+        demucs.separate.main(["--mp3", tmp_file, "-o", f"/tmp/{uid}"])
 
-        output_files = os.listdir(f"{tmp_dir}/htdemucs/{track_name}")
-        for f in output_files:
-            upload_minio(
-                f"{tmp_dir}/htdemucs/{track_name}/{f}", f"{track_name}_{f}", uid
-            )
+    output_files = os.listdir(f"{tmp_dir}/htdemucs/{track_name}")
+    presigned_urls = []
+    for f in output_files:
+        upload_track(f"{tmp_dir}/htdemucs/{track_name}/{f}", f"{track_name}_{f}", uid)
+        presigned_urls.append(get_presigned_url(f"{track_name}_{f}", uid))
 
-        return {
-            "filename": tmp_file,
-            "content_type": file.content_type,
-            "separate": separate,
-            "part": track,
-        }
-    else:
-        return {"error": "Invalid file format. Please upload an MP3 file."}
+    return {
+        "tracks": presigned_urls,
+        "separate": separate,
+        "track": track,
+    }
 
 
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("lambda:app", host="0.0.0.0", port=8000, reload=True)
