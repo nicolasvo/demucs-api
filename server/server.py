@@ -1,14 +1,12 @@
-import json
 from fastapi import FastAPI, File, UploadFile, Form
 from minio import Minio
-from minio.retention import Retention
-from minio.commonconfig import GOVERNANCE
+from minio.commonconfig import ENABLED, Filter
+from minio.lifecycleconfig import LifecycleConfig, Expiration, Rule
 import requests
 
 import uuid
 import os
 from dotenv import load_dotenv
-from datetime import datetime, timedelta, timezone
 import tempfile
 
 load_dotenv()
@@ -40,6 +38,17 @@ def upload_track(file_path: str, file_name: str, uid: str):
         print("Created bucket", bucket_name)
     else:
         print("Bucket", bucket_name, "already exists")
+    config = LifecycleConfig(
+        [
+            Rule(
+                ENABLED,
+                rule_filter=Filter(prefix=""),
+                rule_id="expire_songs",
+                expiration=Expiration(days=1),
+            ),
+        ],
+    )
+    client.set_bucket_lifecycle(bucket_name, config)
 
     # Upload the file, renaming it in the process
     client.fput_object(
@@ -47,8 +56,6 @@ def upload_track(file_path: str, file_name: str, uid: str):
         destination_file,
         source_file,
     )
-    config = Retention(GOVERNANCE, datetime.utcnow() + timedelta(days=1))
-    client.set_object_retention(bucket_name, destination_file, config)
     print(
         source_file,
         "successfully uploaded as object",
