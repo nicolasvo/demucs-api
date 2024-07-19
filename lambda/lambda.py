@@ -126,7 +126,7 @@ async def run_demucs(command, tmp_dir, track_name, uid):
             else:
                 current_line += char
         except Exception as e:
-            print(e)
+            pass
 
     # Process is complete, prepare the final response
     await process.wait()

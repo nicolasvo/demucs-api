@@ -1,0 +1,5 @@
+services:
+  demucs-bot:
+    image: splitsongbot:latest
+    env_file: ".env"
+    restart: "always"
