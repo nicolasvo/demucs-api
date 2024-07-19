@@ -1,5 +1,9 @@
+import asyncio
+import json
+import subprocess
 from fastapi import FastAPI
 import demucs.separate
+from fastapi.responses import StreamingResponse
 from minio import Minio
 from minio.commonconfig import ENABLED, Filter
 from minio.lifecycleconfig import LifecycleConfig, Expiration, Rule
@@ -95,6 +99,58 @@ def get_presigned_url(file_name: str, uid: str):
     return url
 
 
+async def run_demucs(command, tmp_dir, track_name, uid):
+    process = await asyncio.create_subprocess_exec(
+        *command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+    )
+
+    current_line = ""
+    previous_line = ""
+    while True:
+        char = await process.stdout.read(1)
+        if not char:
+            break
+        try:
+            char = char.decode()
+            if char == "\r":  # Carriage return, update the current line
+                if current_line != previous_line:
+                    print(current_line)
+                    yield current_line + "\n"
+                    previous_line = current_line
+                current_line = ""
+            elif char == "\n":  # Newline, yield the current line
+                print(current_line)
+                yield current_line + "\n"
+                current_line = ""
+                previous_line = ""
+            else:
+                current_line += char
+        except Exception as e:
+            print(e)
+
+    # Process is complete, prepare the final response
+    await process.wait()
+    output_files = os.listdir(f"{tmp_dir}/htdemucs/{track_name}")
+    presigned_urls = []
+    for f in output_files:
+        upload_track(f"{tmp_dir}/htdemucs/{track_name}/{f}", f"{track_name}_{f}", uid)
+        presigned_urls.append(
+            {
+                "url": get_presigned_url(f"{track_name}_{f}", uid),
+                "file": f"{track_name}_{f}",
+            }
+        )
+
+    final_response = {
+        "tracks": presigned_urls,
+        "separate": command[3] if len(command) > 3 else "everything",
+        "track": track_name,
+        "log_file": f"/tmp/demucs_log_{uid}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+    }
+    print(f"FINAL_RESPONSE: {json.dumps(final_response)}\n")
+    yield json.dumps(final_response)
+
+
 @app.post("/split_track/")
 async def split_track(
     file_name: str,
@@ -109,23 +165,23 @@ async def split_track(
     download_track(file_name, uid, tmp_file)
 
     if separate == "only":
-        demucs.separate.main(
-            ["--mp3", "--two-stems", track, tmp_file, "-o", f"/tmp/{uid}"]
-        )
+        command = [
+            "demucs",
+            "--mp3",
+            "--two-stems",
+            track,
+            tmp_file,
+            "-o",
+            f"/tmp/{uid}",
+        ]
     elif separate == "everything":
-        demucs.separate.main(["--mp3", tmp_file, "-o", f"/tmp/{uid}"])
+        command = ["demucs", "--mp3", tmp_file, "-o", f"/tmp/{uid}"]
+    else:
+        return {"error": "Invalid separation option"}
 
-    output_files = os.listdir(f"{tmp_dir}/htdemucs/{track_name}")
-    presigned_urls = []
-    for f in output_files:
-        upload_track(f"{tmp_dir}/htdemucs/{track_name}/{f}", f"{track_name}_{f}", uid)
-        presigned_urls.append(get_presigned_url(f"{track_name}_{f}", uid))
-
-    return {
-        "tracks": presigned_urls,
-        "separate": separate,
-        "track": track,
-    }
+    return StreamingResponse(
+        run_demucs(command, tmp_dir, track_name, uid), media_type="text/plain"
+    )
 
 
 if __name__ == "__main__":

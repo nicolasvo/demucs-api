@@ -1,18 +1,18 @@
 from fastapi import FastAPI, File, UploadFile, Form
+from fastapi.responses import StreamingResponse
 from minio import Minio
 from minio.commonconfig import ENABLED, Filter
 from minio.lifecycleconfig import LifecycleConfig, Expiration, Rule
 import requests
-
+import httpx
 import uuid
 import os
 from dotenv import load_dotenv
 import tempfile
+import json
 
 load_dotenv()
 app = FastAPI()
-
-# TODO: default remove voice from song
 
 
 def upload_track(file_path: str, file_name: str, uid: str):
@@ -23,21 +23,17 @@ def upload_track(file_path: str, file_name: str, uid: str):
         secure=False,
     )
 
-    # The file to upload, change this path if needed
     source_file = file_path
-
-    # The destination bucket and filename on the MinIO server
     bucket_name = "songs"
-    # destination_file = file_name
     destination_file = f"{uid}/{file_name}"
 
-    # Make the bucket if it doesn't exist.
     found = client.bucket_exists(bucket_name)
     if not found:
         client.make_bucket(bucket_name, object_lock=True)
         print("Created bucket", bucket_name)
     else:
         print("Bucket", bucket_name, "already exists")
+
     config = LifecycleConfig(
         [
             Rule(
@@ -50,7 +46,6 @@ def upload_track(file_path: str, file_name: str, uid: str):
     )
     client.set_bucket_lifecycle(bucket_name, config)
 
-    # Upload the file, renaming it in the process
     client.fput_object(
         bucket_name,
         destination_file,
@@ -77,7 +72,7 @@ async def upload_mp3_file(
             tmp_file = tmp_dir + "/" + file.filename
             with open(tmp_file, "wb") as f:
                 f.write(file.file.read())
-                upload_track(tmp_file, file.filename, uid)
+            upload_track(tmp_file, file.filename, uid)
 
         data = {
             "file_name": file.filename,
@@ -85,14 +80,27 @@ async def upload_mp3_file(
             "separate": separate,
             "track": track,
         }
-        try:
-            response = requests.post(os.getenv("LAMBDA_URL"), params=data)
-            if response.status_code != 200:
-                return f"error: {response.text}"
-        except Exception as e:
-            return f"error: {e}"
 
-        return response.json()
+        async def stream_response():
+            async with httpx.AsyncClient() as client:
+                async with client.stream(
+                    "POST", os.getenv("LAMBDA_URL"), params=data, timeout=600
+                ) as response:
+                    async for chunk in response.aiter_text():
+                        if "seconds" in chunk:
+                            print(f"Received chunk: {chunk}")
+                            yield chunk
+                        try:
+                            j = json.loads(chunk)
+                            print(j)
+                            yield json.dumps(j)
+                        except:
+                            pass
+
+        return StreamingResponse(
+            stream_response(),
+            media_type="text/plain",
+        )
     else:
         return {"error": "Invalid file format. Please upload an MP3 file."}
 
